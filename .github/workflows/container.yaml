@@ -10,6 +10,11 @@
 # Skips:
 #   - Documentation-only changes
 #   - Web-only changes (web/** without Go changes)
+#
+# The riscv64 job only runs on a manual workflow_dispatch. It builds a
+# linux/riscv64 image with the plain Dockerfile and publishes it to the GHCR
+# namespace of whichever repository the workflow runs in, using GITHUB_TOKEN
+# instead of the upstream GH_CR_PAT secret, so it works from a fork.
 
 name: Build development container
 
@@ -178,3 +183,68 @@ jobs:
           aws s3 cp dist/index.html "s3://$S3_BUCKET/$PREFIX/index.html" --endpoint-url "$S3_ENDPOINT" \
             --acl public-read --content-type text/html --no-progress
           echo "Published binaries: $S3_ENDPOINT/$S3_BUCKET/$PREFIX/index.html"
+
+  # Manual, fork-friendly build of a linux/riscv64 container image.
+  #
+  # The Earthly job above cross-compiles with musl toolchains and pushes to
+  # ghcr.io/owncast using the GH_CR_PAT secret, neither of which is available
+  # from a fork. This job instead reuses the convenience Dockerfile, builds
+  # natively for linux/riscv64 under QEMU, and pushes to ghcr.io/<owner>/owncast
+  # with the workflow's own GITHUB_TOKEN.
+  #
+  # CGO is required for the SQLite driver, so the Go binary is compiled inside
+  # an emulated riscv64 Alpine image. A cold build is slow; the Buildx GitHub
+  # Actions cache makes repeat builds much faster.
+  riscv64:
+    name: linux/riscv64 container
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: riscv64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image metadata
+        id: meta
+        run: |
+          # GHCR requires a lowercase repository path.
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "version=$(date +%Y%m%d)-riscv64" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push linux/riscv64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/riscv64
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:riscv64
+            ${{ steps.meta.outputs.image }}:riscv64-${{ github.sha }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            GIT_COMMIT=${{ github.sha }}
+            NAME=linux-riscv64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify published manifest
+        run: docker buildx imagetools inspect "${{ steps.meta.outputs.image }}:riscv64"
